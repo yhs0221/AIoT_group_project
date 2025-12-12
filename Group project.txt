@@ -1,0 +1,234 @@
+from picamera2 import Picamera2
+from ultralytics import YOLO
+import cv2
+import time
+import math
+from collections import defaultdict, deque
+
+MODEL_PATH = "yolov8n.pt"
+CONF_THRES = 0.50
+IMG_SIZE = (640, 480)
+
+WINDOW_NAME = "Smart Green Office Plus - YOLOv8 + Picamera2"
+FONT = cv2.FONT_HERSHEY_SIMPLEX
+
+FPS_SMOOTH_N = 12
+COUNTS_SMOOTH_N = 8
+
+DEVICE_CLASSES = {"tv", "laptop", "cell phone", "keyboard", "mouse"}
+DRINK_CLASSES = {"bottle", "cup", "wine glass"}
+FOOD_CLASSES = {"banana", "apple", "sandwich", "orange", "broccoli", "carrot", "hot dog", "pizza", "donut", "cake"}
+CLUTTER_CLASSES = {"book", "remote", "keyboard", "mouse", "scissors", "backpack", "handbag", "tie"}
+SHARP_CLASSES = {"knife", "scissors"}
+
+POWER_W = {
+    "laptop": 45,
+    "tv": 120,
+    "cell phone": 6,
+    "keyboard": 2,
+    "mouse": 1,
+    "person": 15, 
+}
+
+DRINK_NEAR_LAPTOP_NORM = 0.18
+
+def clamp01(x):
+    return max(0.0, min(1.0, float(x)))
+
+def safe_get_name(names, cls_id):
+    try:
+        return names[int(cls_id)]
+    except Exception:
+        return str(cls_id)
+
+def bbox_center_xyxy(x1, y1, x2, y2):
+    return ((x1 + x2) * 0.5, (y1 + y2) * 0.5)
+
+def l2_norm(a, b):
+    return math.sqrt((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2)
+
+def draw_panel(img, lines, x=10, y=10, line_h=22):
+    pad = 8
+    max_w = 0
+    for s in lines:
+        (tw, th), _ = cv2.getTextSize(s, FONT, 0.55, 2)
+        max_w = max(max_w, tw)
+    panel_w = max_w + pad * 2
+    panel_h = line_h * len(lines) + pad * 2
+
+    overlay = img.copy()
+    cv2.rectangle(overlay, (x, y), (x + panel_w, y + panel_h), (0, 0, 0), -1)
+    img[:] = cv2.addWeighted(overlay, 0.35, img, 0.65, 0)
+
+    yy = y + pad + 16
+    for s in lines:
+        cv2.putText(img, s, (x + pad, yy), FONT, 0.55, (255, 255, 255), 2)
+        yy += line_h
+
+def score_bar(score_0_100):
+    score = int(clamp01(score_0_100 / 100.0) * 100)
+    blocks = int(score / 10)
+    return "[" + ("#" * blocks).ljust(10, ".") + "] %d" % score
+def main():
+    model = YOLO(MODEL_PATH)
+    names = model.names
+
+    picam2 = Picamera2()
+    config = picam2.create_preview_configuration(main={"format": "RGB888", "size": IMG_SIZE})
+    picam2.configure(config)
+    picam2.start()
+
+    print("Smart Green Office Plus started.")
+    print("Press 'q' in the window to quit.")
+
+    fps_hist = deque(maxlen=FPS_SMOOTH_N)
+
+    smooth_hist = {
+        "people": deque(maxlen=COUNTS_SMOOTH_N),
+        "devices": deque(maxlen=COUNTS_SMOOTH_N),
+        "drinks": deque(maxlen=COUNTS_SMOOTH_N),
+        "clutter": deque(maxlen=COUNTS_SMOOTH_N),
+    }
+
+    last_time = time.time()
+
+    try:
+        while True:
+            frame = picam2.capture_array()
+            if frame is None:
+                print("ERROR: Empty frame.")
+                break
+
+            if frame.ndim == 3 and frame.shape[2] == 4:
+                frame = cv2.cvtColor(frame, cv2.COLOR_RGBA2RGB)
+
+            results = model(frame, verbose=False)
+            r0 = results[0]
+            annotated = r0.plot()
+            counts = defaultdict(int)
+            centers = defaultdict(list) 
+            boxes_by_class = defaultdict(list)
+
+            H, W = annotated.shape[:2]
+            diag = math.sqrt(W * W + H * H)
+
+            for box in r0.boxes:
+                conf = float(box.conf[0])
+                if conf < CONF_THRES:
+                    continue
+
+                cls_id = int(box.cls[0])
+                cls_name = safe_get_name(names, cls_id)
+
+                x1, y1, x2, y2 = box.xyxy[0].tolist()
+                cx, cy = bbox_center_xyxy(x1, y1, x2, y2)
+
+                counts[cls_name] += 1
+                centers[cls_name].append((cx, cy))
+                boxes_by_class[cls_name].append((x1, y1, x2, y2, conf))
+
+            people = counts["person"]
+            devices = sum(counts[c] for c in DEVICE_CLASSES)
+            drinks = sum(counts[c] for c in DRINK_CLASSES)
+            food = sum(counts[c] for c in FOOD_CLASSES)
+            clutter = sum(counts[c] for c in CLUTTER_CLASSES)
+            sharps = sum(counts[c] for c in SHARP_CLASSES)
+
+            for k, v in [("people", people), ("devices", devices), ("drinks", drinks), ("clutter", clutter)]:
+                smooth_hist[k].append(v)
+
+            def smoothed(k):
+                dq = smooth_hist[k]
+                if not dq:
+                    return 0.0
+                return sum(dq) / float(len(dq))
+
+            people_s = smoothed("people")
+            devices_s = smoothed("devices")
+            drinks_s = smoothed("drinks")
+            clutter_s = smoothed("clutter")
+
+            meeting_mode = (people_s >= 3.0 and devices_s >= 2.0)
+
+            drink_near_laptop = False
+            if centers.get("laptop") and any(centers.get(c) for c in DRINK_CLASSES):
+                for lp in centers["laptop"]:
+                    for dc in DRINK_CLASSES:
+                        for dr in centers.get(dc, []):
+                            d = l2_norm(lp, dr) / (diag + 1e-6)
+                            if d < DRINK_NEAR_LAPTOP_NORM:
+                                drink_near_laptop = True
+                                break
+                        if drink_near_laptop:
+                            break
+                    if drink_near_laptop:
+                        break
+            est_power = 0
+            for cls, w in POWER_W.items():
+                est_power += int(counts.get(cls, 0) * w)
+
+            focus = 100.0
+            focus -= clamp01(people_s / 6.0) * 35.0
+            focus -= clamp01(clutter_s / 12.0) * 35.0
+            focus -= 18.0 if drink_near_laptop else 0.0
+            focus -= 12.0 if meeting_mode else 0.0
+            focus = clamp01(focus / 100.0) * 100.0
+
+            green = 100.0
+            green -= clamp01(devices_s / 8.0) * 55.0
+            green -= clamp01(people_s / 8.0) * 25.0
+            green = clamp01(green / 100.0) * 100.0
+
+            safety_warns = []
+            if sharps > 0:
+                safety_warns.append("Sharp objects detected")
+            if drink_near_laptop:
+                safety_warns.append("Drink near laptop risk")
+            if food > 0 and devices > 0:
+                safety_warns.append("Food near devices")
+
+            now = time.time()
+            fps = 1.0 / (now - last_time + 1e-8)
+            last_time = now
+            fps_hist.append(fps)
+            fps_s = sum(fps_hist) / float(len(fps_hist))
+
+            if people == 0 and devices > 0:
+                tip = "Tip: Nobody here. Consider auto-sleep screens to save energy."
+            elif meeting_mode:
+                tip = "Tip: Meeting mode. Auto-notes + mute reminders could help."
+            elif drink_near_laptop:
+                tip = "Tip: Move drinks away from electronics (spill risk)."
+            elif drinks == 0 and people > 0:
+                tip = "Tip: Hydration reminder. Keep water nearby."
+            elif clutter > 6:
+                tip = "Tip: High clutter index. A 2-minute reset can boost focus."
+            else:
+                tip = "Tip: Smart monitoring: optimize comfort, safety, and energy."
+
+            line1 = "People:%d  Devices:%d  Drinks:%d  Clutter:%d  Food:%d" % (people, devices, drinks, clutter, food)
+            line2 = "FPS:%.1f  EstPower:%dW  Mode:%s" % (fps_s, est_power, ("MEETING" if meeting_mode else "NORMAL"))
+            line3 = "Focus " + score_bar(focus) + "  Green " + score_bar(green)
+
+            lines = [line1, line2, line3]
+
+            if safety_warns:
+                lines.append("Alerts: " + " | ".join(safety_warns))
+            lines.append(tip)
+
+            draw_panel(annotated, lines, x=10, y=10, line_h=22)
+
+            cv2.imshow(WINDOW_NAME, annotated)
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                break
+
+    except KeyboardInterrupt:
+        print("Stopped by user (Ctrl+C).")
+
+    picam2.stop()
+    cv2.destroyAllWindows()
+    print("Finished. Camera stopped.")
+
+
+if __name__ == "__main__":
+    main()
